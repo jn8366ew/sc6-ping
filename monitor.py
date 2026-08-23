@@ -30,9 +30,12 @@ SC6는 딜레이 기반 넷코드라 늦게 온 패킷을 되감아 보정하지
       저장하거나 외부에 공유하지 마세요.
 """
 
+import os
 import re
 import sys
 import time
+import array
+import bisect
 import ctypes
 import shutil
 import socket
@@ -99,6 +102,22 @@ FRAME_GAP_FACTOR = 2.0
 # 예전 주석의 '포트당 10개'는 과대 추정이었다. 실측 포트 수가 58까지 갔으므로
 # 200이면 3배 넘는 여유가 생긴다(약 1000명령, 한도의 25%).
 MAX_FILTER_PORTS = 200
+
+# --- 판 단위 요약 ---
+# 대전 조건이 이만큼 연속으로 깨지면 판이 끝난 것으로 본다. 실측된 렉은
+# 6초짜리였다(132 -> 16 -> 132pkt/s). 그 두 배를 둬서 렉을 판 종료로
+# 오인하지 않게 한다. 유예 구간의 표본은 통계에 넣지 않는다 - 붕괴 중이라
+# 지터가 400ms대로 튀어서, 섞으면 멀쩡한 판도 나쁘게 나온다.
+MATCH_END_GRACE = 12.0
+# 이보다 짧으면 요약을 내지 않는다. 매칭 단계의 순간 스파이크가 '판'으로
+# 잡히는 걸 막는다.
+MATCH_MIN_SECONDS = 30.0
+
+# 상대 IP -> 국가/ISP. iptoasn.com의 ip2asn-v4.tsv (탭 구분).
+# 없으면 조용히 비활성화된다 - 부가 기능 때문에 본체가 죽으면 안 된다.
+GEO_DB_FILE = "ip2asn-v4.tsv"
+GEO_MAX_ROWS = 2_000_000  # 파일이 이상하게 크면 여기서 끊는다
+TAB = "\t"
 
 GAME_PROCESS = "SoulcaliburVI.exe"
 # 스팀 네트워킹은 게임 프로세스가 아니라 스팀 클라이언트 소켓을 경유할 수도
@@ -342,6 +361,185 @@ def match_console_encoding() -> None:
             )
         except Exception:
             pass  # 못 바꿔도 측정은 돌아간다
+
+
+
+# ---------------------- 상대 IP -> 국가 / ISP ----------------------
+# 국가코드 -> 한글. 전체 ISO 3166을 들고 있을 이유는 없다. 여기 없으면
+# 코드를 그대로 보여준다 - 모르는 걸 지어내지 않는다.
+COUNTRY_NAMES = {
+    "KR": "한국", "JP": "일본", "CN": "중국", "TW": "대만", "HK": "홍콩",
+    "SG": "싱가포르", "TH": "태국", "VN": "베트남", "PH": "필리핀",
+    "MY": "말레이시아", "ID": "인도네시아", "IN": "인도", "AU": "호주",
+    "NZ": "뉴질랜드", "US": "미국", "CA": "캐나다", "MX": "멕시코",
+    "BR": "브라질", "AR": "아르헨티나", "CL": "칠레", "GB": "영국",
+    "FR": "프랑스", "DE": "독일", "NL": "네덜란드", "SE": "스웨덴",
+    "NO": "노르웨이", "FI": "핀란드", "DK": "덴마크", "PL": "폴란드",
+    "ES": "스페인", "IT": "이탈리아", "PT": "포르투갈", "RU": "러시아",
+    "UA": "우크라이나", "TR": "터키", "SA": "사우디", "AE": "UAE",
+    "IL": "이스라엘", "ZA": "남아공", "EG": "이집트", "LU": "룩셈부르크",
+}
+
+
+class GeoInfo:
+    """한 IP의 국가/ISP."""
+
+    def __init__(self, cc: str, asn: int, org: str):
+        self.cc = cc
+        self.asn = asn
+        self.org = org
+
+    @property
+    def country(self) -> str:
+        return COUNTRY_NAMES.get(self.cc, self.cc)
+
+    def label(self) -> str:
+        """'중국 · China Telecom (AS4134)' 형태. 모르는 부분은 빼고 만든다."""
+        parts = []
+        if self.cc:
+            parts.append(self.country)
+        if self.org:
+            org = self.org if self.asn <= 0 else f"{self.org} (AS{self.asn})"
+            parts.append(org)
+        elif self.asn > 0:
+            parts.append(f"AS{self.asn}")
+        return " · ".join(parts)
+
+
+class GeoDB:
+    """IP 대역 -> 국가/ASN 표. 파일이 없으면 조용히 no-op이 된다.
+
+    RTSS가 없을 때 OSD가 no-op으로 떨어지는 것과 같은 이유다. 상대 국가를
+    모른다고 측정을 못 할 이유가 없다.
+
+    형식은 iptoasn.com의 ip2asn-v4.tsv 기준이다 (탭 구분, 헤더 없음):
+
+        range_start  range_end  AS_number  country_code  AS_description
+
+    파싱이 안 되면 reason에 사유를 남기고 비활성화한다 - 형식이 바뀌었을 때
+    엉뚱한 나라를 보여주느니 아무것도 안 보여주는 게 낫다.
+
+    메모리: 대역 하나당 12바이트(array 3개)에 ASN별 조직명 dict. 같은 ASN이
+    여러 대역에 나오므로 이름을 dict로 접으면 크게 줄어든다. 40만 대역 기준
+    10MB 안쪽을 목표로 한다 - 이 도구는 24초 4.2MB 고정이 검증된 물건이라
+    그 전제를 크게 깨면 안 된다.
+    """
+
+    def __init__(self, path: str = GEO_DB_FILE):
+        self.path = path
+        self.reason = "미로드"
+        self._ready = False
+        # 'I'는 어느 플랫폼에서나 4바이트 이상이다. IPv4(2^32-1)와
+        # 32비트 ASN이 둘 다 들어간다.
+        self._starts = array.array("I")
+        self._ends = array.array("I")
+        self._asns = array.array("I")
+        self._ccs = bytearray()  # 2바이트 고정
+        self._orgs: dict[int, str] = {}
+        self._cache: dict[str, GeoInfo | None] = {}
+        self._lock = threading.Lock()
+        # 로더는 별도 스레드라 직접 print하면 메인 출력과 줄이 섞인다.
+        # Pinger.trace_note와 같은 방식으로 메인이 꺼내 가게 둔다.
+        self.note: str | None = None
+
+    def load_async(self) -> None:
+        """데몬 스레드로 읽는다. 수십 MB를 메인에서 읽으면 기동이 멈춘다."""
+        threading.Thread(target=self._load_and_note, daemon=True, name="GeoDB").start()
+
+    def _load_and_note(self) -> None:
+        self.load()
+        self.note = f"국가/ISP 표: {self.reason}"
+
+    def take_note(self) -> str | None:
+        note, self.note = self.note, None
+        return note
+
+    def load(self) -> None:
+        if not os.path.exists(self.path):
+            self.reason = f"{self.path} 없음 (국가/ISP 표시 안 함)"
+            return
+        starts, ends, asns = array.array("I"), array.array("I"), array.array("I")
+        ccs, orgs = bytearray(), {}
+        rows = bad = 0
+        try:
+            with open(self.path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if rows >= GEO_MAX_ROWS:
+                        break
+                    parts = line.rstrip().split(TAB)
+                    if len(parts) < 4:
+                        bad += 1
+                        continue
+                    try:
+                        lo = int(ipaddress.ip_address(parts[0]))
+                        hi = int(ipaddress.ip_address(parts[1]))
+                        asn = int(parts[2])
+                    except ValueError:
+                        bad += 1
+                        continue
+                    cc = parts[3].strip().upper()
+                    # 'None'은 미할당 대역이다. 빈 값과 같이 취급한다.
+                    if cc in ("NONE", "ZZ", "--"):
+                        cc = ""
+                    org = parts[4].strip() if len(parts) > 4 else ""
+                    if org.lower() in ("not routed", "none"):
+                        org = ""
+                    starts.append(lo)
+                    ends.append(hi)
+                    asns.append(asn)
+                    ccs += (cc[:2].ljust(2)).encode("ascii", "replace")
+                    if asn and org and asn not in orgs:
+                        orgs[asn] = org
+                    rows += 1
+        except OSError as e:
+            self.reason = f"읽기 실패 ({e})"
+            return
+
+        if rows == 0 or bad > rows:
+            self.reason = f"형식을 알 수 없음 (유효 {rows}줄, 실패 {bad}줄)"
+            return
+        # 이분 탐색을 하려면 시작 주소가 오름차순이어야 한다. 원본이 이미
+        # 정렬돼 있지만 믿지 않고 확인한다.
+        if any(starts[i] > starts[i + 1] for i in range(len(starts) - 1)):
+            self.reason = "시작 주소가 정렬돼 있지 않음"
+            return
+
+        with self._lock:
+            self._starts, self._ends, self._asns = starts, ends, asns
+            self._ccs, self._orgs = ccs, orgs
+            self._ready = True
+        self.reason = f"{rows:,}개 대역 / ASN {len(orgs):,}개"
+
+    @property
+    def available(self) -> bool:
+        return self._ready
+
+    def lookup(self, ip: str) -> GeoInfo | None:
+        if not self._ready:
+            return None
+        hit = self._cache.get(ip, False)
+        if hit is not False:
+            return hit
+        info = self._lookup_uncached(ip)
+        self._cache[ip] = info
+        return info
+
+    def _lookup_uncached(self, ip: str) -> GeoInfo | None:
+        try:
+            addr = int(ipaddress.ip_address(ip))
+        except ValueError:
+            return None
+        with self._lock:
+            # bisect_right - 1 = 시작 주소가 addr 이하인 마지막 대역
+            i = bisect.bisect_right(self._starts, addr) - 1
+            if i < 0 or self._ends[i] < addr:
+                return None  # 어느 대역에도 안 들어간다
+            cc = self._ccs[2 * i : 2 * i + 2].decode("ascii", "replace").strip()
+            asn = self._asns[i]
+            org = self._orgs.get(asn, "")
+        if not cc and not org:
+            return None
+        return GeoInfo(cc, asn, org)
 
 
 # --------------------- 수동 측정: 도착 간격 ---------------------
@@ -1130,6 +1328,245 @@ def format_log(stamp: str, ip: str, ping: dict, flow: Flow | None) -> str:
     return f"{stamp}  {ip:<15s}  {head}{loss}{tail}"
 
 
+# ---------------------- 판 단위 요약과 평가 ----------------------
+# 등급 임계값. **근거의 강도가 항목마다 다르다.** 섞어서 읽으면 안 된다.
+#
+#   갭  : 정의상 확실하다. 프레임이 굶었다 = 게임이 멈춰 기다렸다는 뜻이라
+#         통계적 보정이 필요 없다. 이 도구에서 근거가 유일하게 단단한 지표다.
+#   핑  : 격겜 통념(편도 2~3프레임까지는 무난)에 기댄 값. 근거는 중간이다.
+#   지터: **추측이다.** 실측이 정상(0.4~2ms)과 렉(338~470ms) 두 극단뿐이고
+#         중간 지대 데이터가 아예 없다. 판이 쌓이면 반드시 다시 볼 것.
+#
+# 각 표는 (이 값 이하이면, 이 등급). 어디에도 안 걸리면 D.
+GRADE_GAPS_PER_MIN = [(0.0, "A"), (1.0, "B"), (5.0, "C")]
+GRADE_PING_FRAMES = [(1.0, "A"), (2.0, "B"), (3.0, "C")]  # 편도 프레임
+GRADE_JITTER_MS = [(2.0, "A"), (10.0, "B"), (30.0, "C")]  # 추측값
+
+
+def grade_of(value: float, table: list) -> str:
+    for limit, mark in table:
+        if value <= limit:
+            return mark
+    return "D"
+
+
+def worst_grade(grades) -> str:
+    """종합은 셋 중 최악으로 낸다.
+
+    평균을 내면 갭이 터진 판이 '지터는 좋았으니까'로 희석된다. 갭은 게임이
+    실제로 멈춘 횟수라 다른 지표로 상쇄될 성질이 아니다.
+    """
+    marks = [g for g in grades if g]
+    return max(marks) if marks else "-"  # 'A'<'B'<'C'<'D' 라 max가 최악
+
+
+def duration_text(seconds: float) -> str:
+    m, sec = divmod(int(seconds), 60)
+    return f"{m}분 {sec:02d}초" if m else f"{sec}초"
+
+
+class MatchSummary:
+    """끝난 판 하나의 집계 결과."""
+
+    def __init__(self, ip, geo, stamp, duration, samples):
+        self.ip = ip
+        self.geo = geo  # GeoInfo | None
+        self.stamp = stamp  # 시작 시각 (표시용 문자열)
+        self.duration = duration
+        self.windows = len(samples["rate"])
+
+        rtts = samples["rtt"]
+        self.rtt = statistics.median(rtts) if rtts else None
+        # 한 창이라도 폴백 홉으로 쟀으면 이 판의 핑은 하한이다.
+        self.hop_based = samples["hop_windows"] > 0
+        self.interval = _median_or(samples["interval"])
+        self.jitter = _median_or(samples["jitter"])
+        self.jitter_max = max(samples["jitter"], default=0.0)
+        self.gaps = samples["gaps"]
+        self.gap_worst = max(samples["worst"], default=0.0)
+        self.rate = _median_or(samples["rate"])
+
+        minutes = duration / 60.0
+        self.gaps_per_min = self.gaps / minutes if minutes > 0 else 0.0
+
+        # 편도가 실제 입력 딜레이다. 왕복의 절반.
+        self.frames_rt = ms_to_frames(self.rtt) if self.rtt is not None else None
+        self.frames_ow = self.frames_rt / 2.0 if self.frames_rt is not None else None
+
+        self.g_ping = (
+            grade_of(self.frames_ow, GRADE_PING_FRAMES)
+            if self.frames_ow is not None
+            else None
+        )
+        self.g_jitter = grade_of(self.jitter, GRADE_JITTER_MS)
+        self.g_gap = grade_of(self.gaps_per_min, GRADE_GAPS_PER_MIN)
+        self.grade = worst_grade([self.g_ping, self.g_jitter, self.g_gap])
+
+
+def _median_or(values, default=0.0) -> float:
+    return statistics.median(values) if values else default
+
+
+class MatchTracker:
+    """판의 시작과 끝을 잡고 창별 표본을 모은다.
+
+    **로그 틱(2초)에서만 먹인다.** JITTER_WINDOW가 정확히 2.0초라 창이
+    겹치지 않아서다. 250ms 표시 틱에서 먹이면 같은 패킷을 8번 세게 되어
+    갭 횟수가 8배로 부푼다.
+    """
+
+    def __init__(self, geo: "GeoDB | None" = None):
+        self.geo = geo
+        self.ip = None
+        self._clear()
+
+    def _clear(self) -> None:
+        self.ip = None
+        self.started = 0.0
+        self.stamp = ""
+        self.last_ok = 0.0
+        self._s = {
+            "rtt": [], "interval": [], "jitter": [],
+            "worst": [], "rate": [], "gaps": 0, "hop_windows": 0,
+        }
+
+    @staticmethod
+    def is_match(flow, opponent) -> bool:
+        """대전 중인가. 판정은 이미 있는 값 그대로 쓴다."""
+        return (
+            opponent is not None
+            and flow is not None
+            and flow.frame_paced
+            and flow.rate >= KEEP_RATE
+        )
+
+    def feed(self, now: float, opponent, flow, stats) -> MatchSummary | None:
+        """한 창을 반영한다. 판이 방금 끝났으면 그 요약을 돌려준다."""
+        ok = self.is_match(flow, opponent)
+        done = None
+
+        # 상대가 바뀐 건 확정적인 경계다. 유예를 둘 이유가 없다.
+        if self.ip is not None and opponent != self.ip:
+            done = self._finish()
+
+        if self.ip is None:
+            if ok:
+                self._begin(opponent, now)
+        if self.ip is not None:
+            if ok:
+                self._collect(now, flow, stats)
+            elif now - self.last_ok >= MATCH_END_GRACE:
+                # 유예를 넘겼다. 이 구간의 표본은 이미 안 모았으므로
+                # 붕괴 중의 지터/갭이 통계에 섞이지 않는다.
+                done = self._finish()
+        return done
+
+    def flush(self) -> MatchSummary | None:
+        """게임 종료나 Ctrl+C 때 진행 중이던 판을 마감한다."""
+        return self._finish() if self.ip is not None else None
+
+    def _begin(self, ip: str, now: float) -> None:
+        self._clear()
+        self.ip = ip
+        self.started = now
+        self.last_ok = now
+        self.stamp = time.strftime("%H:%M:%S")
+
+    def _collect(self, now: float, flow, stats) -> None:
+        self.last_ok = now
+        s = self._s
+        if stats["avg"] is not None:
+            s["rtt"].append(stats["avg"])
+        if stats["hop"] is not None:
+            s["hop_windows"] += 1
+        s["interval"].append(flow.median_gap)
+        s["jitter"].append(flow.jitter)
+        s["worst"].append(flow.worst_gap)
+        s["rate"].append(flow.rate)
+        s["gaps"] += flow.frame_gaps
+
+    def _finish(self) -> MatchSummary | None:
+        ip, stamp = self.ip, self.stamp
+        # 창 하나가 JITTER_WINDOW만큼을 대표하므로 그만큼을 더한다.
+        span = (self.last_ok - self.started) + JITTER_WINDOW
+        samples = self._s
+        self._clear()
+        if ip is None or span < MATCH_MIN_SECONDS or not samples["rate"]:
+            # 매칭 단계의 순간 스파이크는 판이 아니다.
+            return None
+        geo = self.geo.lookup(ip) if self.geo else None
+        return MatchSummary(ip, geo, stamp, span, samples)
+
+
+def format_match_summary(m: MatchSummary) -> list[str]:
+    """판 요약 블록. 호출부가 각 줄을 fit_width()로 자른다."""
+    who = m.ip
+    if m.geo:
+        label = m.geo.label()
+        if label:
+            who = f"{m.ip}  {label}"
+    lines = [
+        "",
+        f"[판 종료] {who}   {duration_text(m.duration)}",
+    ]
+
+    detail = f"핑 {m.g_ping} / 지터 {m.g_jitter} / 갭 {m.g_gap}"
+    if m.g_ping is None:
+        detail = f"핑 -- / 지터 {m.g_jitter} / 갭 {m.g_gap}"
+    lines.append(f"  평가  {m.grade}   ({detail})")
+
+    if m.rtt is not None:
+        mark = ">=" if m.hop_based else ""
+        lines.append(
+            f"  핑    {mark}{m.rtt:.1f}ms → {m.frames_rt:.1f}프레임 왕복"
+            f" (편도 {m.frames_ow:.1f})"
+        )
+        if m.hop_based:
+            # 하한으로 잰 값이라 실제 등급은 이보다 나쁠 수 있다. 숨기지 않는다.
+            lines.append("        폴백 홉으로 잰 하한이라 실제는 더 나쁠 수 있음")
+    else:
+        lines.append("  핑    측정 못 함 (ICMP 차단, 폴백 홉도 없음)")
+
+    lines.append(f"  간격  {m.interval:.1f}ms")
+    lines.append(f"  지터  중앙 {m.jitter:.1f}ms   최대 {m.jitter_max:.1f}ms")
+    gap_tail = f"   최악 {m.gap_worst:.0f}ms" if m.gaps else ""
+    lines.append(
+        f"  갭    {m.gaps}회{gap_tail}   ({m.gaps_per_min:.1f}회/분)"
+    )
+    return lines
+
+
+class SessionTally:
+    """게임이 떠 있는 동안의 판들을 모아 마지막에 한 번 정리한다."""
+
+    def __init__(self):
+        self.matches: list[MatchSummary] = []
+
+    def add(self, m: MatchSummary) -> None:
+        self.matches.append(m)
+
+    def lines(self) -> list[str]:
+        if not self.matches:
+            return []
+        n = len(self.matches)
+        opponents = len({m.ip for m in self.matches})
+        rtts = [m.rtt for m in self.matches if m.rtt is not None]
+        gaps = sum(m.gaps for m in self.matches)
+        worst = worst_grade([m.grade for m in self.matches])
+        out = [f"[*] 이번 세션 {n}판 (상대 {opponents}명)"]
+        if rtts:
+            out.append(f"    평균 핑 {statistics.mean(rtts):.0f}ms")
+        out.append(f"    갭 총 {gaps}회   최악 등급 {worst}")
+        for m in self.matches:
+            where = m.geo.country if m.geo and m.geo.cc else ""
+            where = f" {where}" if where else ""
+            out.append(
+                f"      {m.stamp}  {m.ip}{where}"
+                f"  {duration_text(m.duration)}  {m.grade}"
+            )
+        return out
+
+
 def wait_for_game() -> psutil.Process:
     """게임이 뜰 때까지 기다린다.
 
@@ -1151,7 +1588,9 @@ def wait_for_game() -> psutil.Process:
             time.sleep(POLL_INTERVAL)
 
 
-def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None:
+def monitor_session(
+    game: psutil.Process, local_ip: str, pinger: Pinger, geo: GeoDB
+) -> None:
     """게임이 떠 있는 동안 측정한다. 게임이 꺼지면 반환한다."""
     # RTSS는 매 세션 다시 찾는다. 모니터를 먼저 켜둔 뒤에 RTSS가 떴을 수도 있다.
     osd = OSD()
@@ -1162,6 +1601,15 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
     traffic = TrafficWindow()
     probes = ProbeCache()
     port_set = PortSet()
+    tracker = MatchTracker(geo)
+    tally = SessionTally()
+
+    def report(summary: MatchSummary | None) -> None:
+        if summary is None:
+            return
+        tally.add(summary)
+        for line in format_match_summary(summary):
+            print(fit_width(line) if line else "")
 
     def on_packet(pkt):
         if IP not in pkt or UDP not in pkt:
@@ -1232,6 +1680,9 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
             note = pinger.take_note()
             if note:
                 print(f"[*] {note}")
+            note = geo.take_note()
+            if note:
+                print(f"[*] {note}")
 
             if opponent and flow:
                 osd.show(format_osd(stats, flow))
@@ -1245,7 +1696,15 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
                             )
                         )
                     )
+                    # 표본은 여기서만 모은다. 표시 틱(250ms)에서 모으면
+                    # 창이 8겹으로 겹쳐 갭이 8배로 부푼다.
+                    report(tracker.feed(now, opponent, flow, stats))
             else:
+                # 대전 트래픽이 없어도 로그 주기로 한 번은 먹여야 유예
+                # 시계가 돌아 판이 끝난다. 여기서는 표본이 안 쌓인다.
+                if now - last_log >= LOG_INTERVAL:
+                    last_log = now
+                    report(tracker.feed(now, opponent, flow, stats))
                 # RTSS szOSD는 char 배열이라 ASCII만 그려진다. OSD.show()가
                 # encode("ascii", errors="replace")를 하므로 한글을 넣으면
                 # 화면에 'SC6  ?? ?'로 뜬다. 오버레이 문구는 영문으로 둔다.
@@ -1276,6 +1735,13 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
         stop_sniffer(sniffer)
         pinger.set_target(None)
         osd.clear()
+        # Ctrl+C로 끝내도 여기를 지나므로 진행 중이던 판이 버려지지 않는다.
+        report(tracker.flush())
+        rollup = tally.lines()
+        if rollup:
+            print()
+            for line in rollup:
+                print(fit_width(line))
 
 
 def run():
@@ -1287,13 +1753,18 @@ def run():
     )
     print()
 
+    # 수십 MB를 읽으므로 데몬 스레드에 맡긴다. 없으면 조용히 비활성이고
+    # 본체 동작에는 영향이 없다.
+    geo = GeoDB()
+    geo.load_async()
+
     pinger = Pinger()
     pinger.start()
     try:
         # 게임을 껐다 켜도 계속 물고 간다. 스크립트를 한 번 켜두면 끝.
         while True:
             game = wait_for_game()
-            monitor_session(game, local_ip, pinger)
+            monitor_session(game, local_ip, pinger, geo)
             print()
     finally:
         pinger.stop()

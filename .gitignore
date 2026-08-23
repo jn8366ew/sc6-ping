@@ -2,3 +2,5 @@
 __pycache__/
 *.py[cod]
 run.log
+ip2asn-v4.tsv
+ip2asn-v4.tsv.gz
