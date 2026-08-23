@@ -75,6 +75,22 @@ MIN_RATE = 50.0
 # 떨어질 때마다 상대를 놓으면 EMA·핑 이력·tracert 이력이 통째로 리셋된다.
 # 새로 잡을 때는 엄격하게, 놓을 때는 느슨하게 (히스테리시스).
 KEEP_RATE = MIN_RATE / 2
+# 새 상대로 인정할 최소 ↓/↑ 비율. 매칭 잡담은 내 쪽만 쏘고 상대는 거의
+# 답하지 않아서 극단적으로 비대칭이다. 실측:
+#
+#   매칭 잡담   79pkt/s ↑72↓7    0.097  간격 182.6ms(비페이싱)
+#   연결 수립   96pkt/s ↑66↓30   0.455  간격 16.6ms
+#   실제 대전  132pkt/s ↑66↓66   1.000  간격 16.4ms
+#
+# 0.25는 잡담과 수립 사이를 넉넉히 가른다. 수립 단계를 막지 않는 게 중요하다 -
+# 거기서 상대를 잡아야 ICMP 막힌 상대의 tracert 14초를 미리 시작한다.
+#
+# 이미 고른 상대에는 적용하지 않는다. 렉으로 한쪽이 잠깐 죽을 수 있어서다
+# (실측 렉 구간에서 132 -> 16pkt/s까지 떨어졌다). 그건 KEEP_RATE가 맡는다.
+#
+# 판이 '시작'됐는지 보는 MATCH_START_SYMMETRY(0.8)와는 다른 기준이다.
+# 이건 '상대로 볼 만한가'(느슨), 저건 '대전이 실제로 진행 중인가'(엄격).
+MIN_DOWN_RATIO = 0.25
 PROBE_CANDIDATES = 3  # 상대 재선정 때 찔러볼 상위 후보 수
 PROBE_CACHE_TTL = 60.0  # 후보 ICMP 프로브 결과를 재사용하는 기간 (초)
 
@@ -1238,6 +1254,16 @@ class ProbeCache:
         return ok
 
 
+def two_way(flow: Flow) -> bool:
+    """양방향으로 흐르는가.
+
+    매칭 단계에서는 내 게임이 후보에게 초당 70발씩 쏘는데 상대는 몇 발만
+    답한다. 속도만 보면 MIN_RATE를 넘지만 대전은 아니다. 그런 IP를 상대로
+    잡으면 핑 이력과 tracert를 엉뚱한 곳에 쓴다.
+    """
+    return flow.up <= 0 or flow.down >= MIN_DOWN_RATIO * flow.up
+
+
 def pick_opponent(
     flows: dict[str, Flow], current: str | None, probes: ProbeCache
 ) -> str | None:
@@ -1254,7 +1280,7 @@ def pick_opponent(
             return current
 
     ranked = sorted(
-        (f for f in flows.values() if f.rate >= MIN_RATE),
+        (f for f in flows.values() if f.rate >= MIN_RATE and two_way(f)),
         key=lambda f: f.count,
         reverse=True,
     )
@@ -1266,9 +1292,15 @@ def pick_opponent(
     return ranked[0].ip  # 아무도 응답 안 하면 트래픽 1위라도 보여준다
 
 
-def format_osd(ping: dict, flow: Flow | None) -> str:
-    """게임 화면용. 지연과 프레임이 주인공이므로 맨 앞에 둔다."""
+def format_osd(ping: dict, flow: Flow | None, cc: str = "") -> str:
+    """게임 화면용. 지연과 프레임이 주인공이므로 맨 앞에 둔다.
+
+    국가는 두 글자 코드로만 넣는다. szOSD가 ASCII 전용이라 한글을 못 쓰고,
+    화면에서 읽는 건 지연이지 나라 이름이 아니다. 전체 이름은 콘솔에 있다.
+    """
     parts = []
+    if cc:
+        parts.append(cc)
     if ping["avg"] is not None:
         # 폴백 홉을 재는 중이면 하한이다. '>=' 로 그걸 드러낸다.
         mark = ">=" if ping["hop"] else ""
@@ -1668,6 +1700,7 @@ def monitor_session(
     sniffer = None
     current_bpf = None
     opponent = None
+    opp_geo = None  # 현재 상대의 국가/ISP. 상대가 바뀔 때만 갱신한다
     last_reselect = 0.0
     last_log = 0.0
     idle_state = None  # 유휴 로그를 상태 변화 시에만 찍기 위한 것
@@ -1710,6 +1743,12 @@ def monitor_session(
                 if chosen != opponent:
                     opponent = chosen
                     pinger.set_target(opponent)
+                    # 상대가 바뀔 때만 한 줄. 2초 로그에 넣으면 폭이 넘친다.
+                    opp_geo = geo.lookup(opponent) if opponent else None
+                    if opponent:
+                        label = opp_geo.label() if opp_geo else ""
+                        tail = f"  {label}" if label else ""
+                        print(fit_width(f"[*] 상대: {opponent}{tail}"))
                 traffic.forget({opponent} if opponent else set())
 
             # --- 표시 ---
@@ -1726,7 +1765,7 @@ def monitor_session(
                 print(f"[*] {note}")
 
             if opponent and flow:
-                osd.show(format_osd(stats, flow))
+                osd.show(format_osd(stats, flow, opp_geo.cc if opp_geo else ""))
                 idle_state = None
                 if now - last_log >= LOG_INTERVAL:
                     last_log = now
