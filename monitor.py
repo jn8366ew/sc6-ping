@@ -303,6 +303,47 @@ def fit_width(text: str, columns: int | None = None) -> str:
     return "".join(out) + "…"
 
 
+def match_console_encoding() -> None:
+    """파이프로 내보낼 때 콘솔 코드페이지에 맞춰 쓴다.
+
+    콘솔에 직접 쓸 때는 파이썬이 WriteConsoleW로 유니코드를 그대로
+    넘겨서 인코딩을 안 탄다. 그런데 `| Tee-Object` 처럼 파이프를 물리면
+    바이트로 나가고, PowerShell은 그걸 [Console]::OutputEncoding
+    (= 콘솔 코드페이지, 한국어 Windows는 949)으로 되읽는다.
+
+    이 PC는 PYTHONUTF8=1이 잡혀 있어 파이썬이 UTF-8로 쓰는데 콘솔은
+    949라 서로 어긋난다. 실측: `간격 16.6ms`가 `媛꾧꺽 16.6ms`로 찍혔다.
+    숫자만 ASCII라 멀쩡하게 남고 한글과 →↑↓가 전부 깨졌다.
+
+    cp949에는 →↑↓…가 전부 있다. 다만 em dash(—, U+2014)와 en dash(–)는
+    없으므로 출력 문자열에서는 horizontal bar(―, U+2015)를 쓴다. 폭 계산은
+    둘 다 'A'로 같아서 fit_width() 결과가 달라지지 않는다.
+
+    그래도 errors="replace"를 둔다 ― 로그 한 글자 때문에 측정이 죽으면 안 된다.
+    """
+    if not IS_WINDOWS:
+        return
+    try:
+        cp = ctypes.windll.kernel32.GetConsoleOutputCP()
+    except Exception:
+        return  # 콘솔이 없는 환경. 그대로 둔다
+    if not cp:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        # isatty()면 이미 WriteConsoleW라 건드릴 이유가 없다.
+        if stream is None or stream.isatty():
+            continue
+        try:
+            # line_buffering도 같이 켠다. 파이프에 물리면 파이썬은 8KB 블록
+            # 버퍼링을 쓰는데, 2초에 한 줄(약 100바이트) 내는 도구라 화면이
+            # 2분 넘게 밀린다. 실시간으로 보려고 만든 물건이 그러면 안 된다.
+            stream.reconfigure(
+                encoding=f"cp{cp}", errors="replace", line_buffering=True
+            )
+        except Exception:
+            pass  # 못 바꿔도 측정은 돌아간다
+
+
 # --------------------- 수동 측정: 도착 간격 ---------------------
 class Flow:
     """한 IP에 대한 최근 트래픽 통계 스냅샷."""
@@ -696,12 +737,12 @@ class Pinger(threading.Thread):
         if self._target != target:
             return  # 추적하는 사이에 상대가 바뀌었다
         if found is None:
-            self.trace_note = f"{target}: ICMP 차단 — 경로상 응답하는 홉도 없음"
+            self.trace_note = f"{target}: ICMP 차단 ― 경로상 응답하는 홉도 없음"
         elif found.weak:
             # 경로가 일찍 끊긴 추정치는 실제와 무관할 수 있다.
             # 숫자를 만들어 보여주느니 안 쓰는 편이 낫다.
             self.trace_note = (
-                f"{target}: ICMP 차단 — 경로가 {found.hop}홉에서 끊겨"
+                f"{target}: ICMP 차단 ― 경로가 {found.hop}홉에서 끊겨"
                 f"(이후 {found.dark_after}홉 무응답) 추정 불가"
             )
         else:
@@ -712,7 +753,7 @@ class Pinger(threading.Thread):
             # 값은 여전히 하한이지만 그 사실을 숨기지 않는다.
             limit = f", {TRACE_MAX_HOPS}홉까지만 추적" if found.truncated else ""
             self.trace_note = (
-                f"{target}: ICMP 차단 — {found.ip}({found.hop}홉)까지"
+                f"{target}: ICMP 차단 ― {found.ip}({found.hop}홉)까지"
                 f" 재서 하한으로 표시합니다{limit}"
             )
 
@@ -829,7 +870,7 @@ class OSD:
             return
         ver = self._dw(self.OFF_VERSION)
         if ver < 0x00020000:
-            self.reason = f"공유 메모리 v{ver >> 16}.{ver & 0xFFFF} — v2 필요"
+            self.reason = f"공유 메모리 v{ver >> 16}.{ver & 0xFFFF} ― v2 필요"
             self._detach()
             return
         self.reason = f"연결됨 (공유 메모리 v{ver >> 16}.{ver & 0xFFFF})"
@@ -901,7 +942,7 @@ class OSD:
                 self._set_dw(self.OFF_BUSY, 0)
         except Exception as e:
             # 한 번 실패하면 조용히 포기한다. 매 프레임 예외를 낼 순 없다.
-            self.reason = f"쓰기 실패 — 비활성화 ({e})"
+            self.reason = f"쓰기 실패 ― 비활성화 ({e})"
             self._detach()
 
     def clear(self) -> None:
@@ -1113,7 +1154,7 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
             now = time.monotonic()
 
             if not game.is_running():
-                print("[*] 게임 종료 — 대기 상태로 돌아갑니다.")
+                print("[*] 게임 종료 ― 대기 상태로 돌아갑니다.")
                 return
 
             # 캡처 스레드에서 난 예외(Npcap 문제 등)를 메인으로 끌어올린다.
@@ -1171,7 +1212,10 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
                         )
                     )
             else:
-                osd.show("SC6  대기 중")
+                # RTSS szOSD는 char 배열이라 ASCII만 그려진다. OSD.show()가
+                # encode("ascii", errors="replace")를 하므로 한글을 넣으면
+                # 화면에 'SC6  ?? ?'로 뜬다. 오버레이 문구는 영문으로 둔다.
+                osd.show("SC6  idle")
                 # 유휴 상태에서는 같은 줄을 2초마다 도배하지 않는다.
                 # 상태가 바뀔 때만 한 줄 남긴다.
                 # MIN_RATE를 여기서도 쓴다 — "릴레이 경유 매치"라는 문구는
@@ -1184,7 +1228,7 @@ def monitor_session(game: psutil.Process, local_ip: str, pinger: Pinger) -> None
                     if state == "relay":
                         print(
                             fit_width(
-                                f"{stamp}  릴레이 경유 매치 — 상대 IP 노출 안 됨,"
+                                f"{stamp}  릴레이 경유 매치 ― 상대 IP 노출 안 됨,"
                                 f" 측정 불가 ({relay_rate:.0f}pkt/s)"
                             )
                         )
@@ -1222,6 +1266,8 @@ def run():
 
 
 if __name__ == "__main__":
+    # run()보다 먼저. 기동 실패 메시지도 안 깨져야 원인을 읽을 수 있다.
+    match_console_encoding()
     try:
         run()
     except KeyboardInterrupt:
