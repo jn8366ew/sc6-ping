@@ -632,6 +632,10 @@ class Pinger(threading.Thread):
         self._hop: TraceHop | None = None  # 폴백 대상
         self._traced = False  # 대상당 한 번만 추적한다
         self._tracing = False  # 추적 스레드가 도는 중인지
+        # 추적을 상대 선정 즉시 시작하므로, 결과가 '핑이 막혔다'는 판정보다
+        # 먼저 도착할 수 있다. 받아두기만 하고 쓸지는 따로 정한다.
+        self._trace_done = False
+        self._trace_result: TraceHop | None = None
         # IP별 추적 결과. set_target()으로 _traced가 리셋돼도 이건 남으므로
         # 같은 상대를 다시 고르더라도 tracert를 두 번 돌리지 않는다.
         # 값이 None인 항목도 '찾아봤지만 없더라'는 결과라 그대로 캐시한다.
@@ -649,6 +653,8 @@ class Pinger(threading.Thread):
                 self._fails = 0
                 self._hop = None
                 self._traced = False
+                self._trace_done = False
+                self._trace_result = None
 
     def stop(self) -> None:
         self._stopped.set()
@@ -658,16 +664,23 @@ class Pinger(threading.Thread):
             with self._lock:
                 target = self._target
                 hop = self._hop
+                # 상대를 잡자마자 폴백 경로를 찾아 둔다. 예전엔 핑 3회 실패를
+                # 기다린 뒤에야 시작해서, ICMP 막힌 상대면 3초(실패 대기) +
+                # 15초(tracert)를 합쳐 19초 동안 화면에 지연이 안 떴다(실측).
+                # 추적은 별도 스레드라 핑을 막지 않고, 상대가 ICMP에 응답하면
+                # trace_last_hop()이 None을 주므로 결과는 그냥 안 쓰인다.
+                start_trace = target is not None and not self._traced
             if not target:
                 self._stopped.wait(POLL_INTERVAL)
                 continue
+            if start_trace:
+                self._begin_trace(target)  # 락 밖에서 — _begin_trace가 다시 잡는다
 
             started = time.monotonic()
             # 목적지가 막혀 있으면 폴백 홉을 대신 잰다.
             probe = hop.ip if hop else target
             rtt = ping_once(probe, self._stopped)
 
-            need_trace = False
             with self._lock:
                 # 대상이 바뀌었으면 방금 결과는 버린다.
                 if self._target == target:
@@ -680,17 +693,8 @@ class Pinger(threading.Thread):
                             self.avg = rtt
                         else:
                             self.avg += (rtt - self.avg) * PING_ALPHA
-                    need_trace = (
-                        self._fails >= self.FAILS_BEFORE_TRACE
-                        and not self._traced
-                        and self._hop is None
-                    )
-                    # _traced는 여기서 세우지 않는다. 다른 IP 추적이 도는 중이라
-                    # _begin_trace가 그냥 돌아설 수도 있는데, 그때 세워두면
-                    # 이 상대는 영영 추적되지 않는다. 실제로 시작한 쪽에서 세운다.
-
-            if need_trace:
-                self._begin_trace(target)
+                    # 이제 막 무응답 문턱을 넘었다면 받아둔 결과를 쓴다.
+                    self._use_trace_if_needed()
 
             remain = PING_INTERVAL - (time.monotonic() - started)
             if remain > 0:
@@ -707,7 +711,7 @@ class Pinger(threading.Thread):
             if target in self._trace_cache:
                 # 이미 찾아본 IP다. tracert를 다시 돌릴 이유가 없다.
                 self._traced = True
-                self._apply_trace(target, self._trace_cache[target])
+                self._record_trace(target, self._trace_cache[target])
                 return
             if self._tracing:
                 return  # 다른 추적이 도는 중 — 다음 사이클에 다시 시도한다
@@ -730,12 +734,35 @@ class Pinger(threading.Thread):
                     self._trace_cache[target] = found
                     while len(self._trace_cache) > TRACE_CACHE_SIZE:
                         self._trace_cache.popitem(last=False)
-                self._apply_trace(target, found)
+                self._record_trace(target, found)
 
-    def _apply_trace(self, target: str, found: TraceHop | None) -> None:
-        """추적 결과를 반영한다. 반드시 락을 쥔 채로 부른다."""
+    def _record_trace(self, target: str, found: TraceHop | None) -> None:
+        """추적 결과를 보관한다. 반드시 락을 쥔 채로 부른다.
+
+        여기서 곧장 쓰지 않는 이유: 상대를 잡자마자 추적을 시작하므로
+        결과가 '핑이 막혔다'는 판정보다 먼저 올 수 있다. 그때 바로
+        적용하면 ICMP에 멀쩡히 응답하는 상대까지 홉 RTT(하한)로 바꿔
+        표시하게 된다. 쓸지 말지는 _use_trace_if_needed()가 정한다.
+        """
         if self._target != target:
             return  # 추적하는 사이에 상대가 바뀌었다
+        self._trace_done = True
+        self._trace_result = found
+        self._use_trace_if_needed()
+
+    def _use_trace_if_needed(self) -> None:
+        """보관해 둔 추적 결과를 쓸 때가 됐는지 본다. 락을 쥔 채로 부른다.
+
+        핑이 오고 있으면 폴백은 필요 없다. 무응답이 FAILS_BEFORE_TRACE번
+        연속됐을 때만 홉으로 갈아탄다 — 안내 문구도 그때 나간다.
+        """
+        if not self._trace_done or self._hop is not None:
+            return
+        if self._fails < self.FAILS_BEFORE_TRACE:
+            return  # 아직 핑이 살아 있다. 결과는 그대로 들고 있는다
+        target = self._target
+        found = self._trace_result
+        self._trace_done = False  # 안내는 대상당 한 번만
         if found is None:
             self.trace_note = f"{target}: ICMP 차단 ― 경로상 응답하는 홉도 없음"
         elif found.weak:
@@ -1041,7 +1068,12 @@ def format_osd(ping: dict, flow: Flow | None) -> str:
         parts.append(f"GAP {flow.gap_rate:.1f}")
     # 손실률은 핑이 응답하는 중일 때만 의미가 있다. 무응답일 때의 100%는
     # 게임 트래픽 손실로 오해되는데, 실제 대전 연결은 멀쩡한 경우가 많다.
-    if ping["avg"] is not None and ping["loss"]:
+    #
+    # 폴백 홉을 재는 중에도 숨긴다. 그 손실은 상대가 아니라 경로 중간
+    # 라우터가 ICMP를 rate-limit하는 것이다. 실측: 11홉 라우터가 10~33%를
+    # 흘리는 동안 대전 연결은 132pkt/s ↑66↓66으로 멀쩡했다. 오버레이에
+    # 'LOSS 20%'가 뜨면 게임이 끊기는 걸로 읽을 수밖에 없다.
+    if ping["avg"] is not None and ping["loss"] and not ping["hop"]:
         parts.append(f"LOSS {ping['loss']:.0f}%")
     return "SC6  " + "  ".join(parts)
 
@@ -1088,9 +1120,11 @@ def format_log(stamp: str, ip: str, ping: dict, flow: Flow | None) -> str:
             f"  {flow.rate:.0f}pkt/s ↑{up_rate:.0f}↓{down_rate:.0f}"
         )
     # 무응답일 때의 '손실 100%'는 위 head와 중복이고 오해만 부른다.
+    # 폴백 홉을 재는 중이면 그 손실은 중간 라우터의 ICMP rate-limit이지
+    # 상대와의 손실이 아니다 — OSD와 같은 이유로 숨긴다.
     loss = (
         f"  손실 {ping['loss']:.0f}%"
-        if ping["avg"] is not None and ping["loss"]
+        if ping["avg"] is not None and ping["loss"] and not ping["hop"]
         else ""
     )
     return f"{stamp}  {ip:<15s}  {head}{loss}{tail}"
