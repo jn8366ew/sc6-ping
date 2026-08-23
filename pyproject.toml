@@ -1,0 +1,12 @@
+[project]
+name = "sc6-ping"
+version = "0.1.0"
+description = "SoulCalibur VI P2P 상대 핑 모니터"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil>=7.2.2",
+    "scapy>=2.6.1",
+]
+
+[tool.uv]
+package = false
