@@ -112,6 +112,12 @@ MATCH_END_GRACE = 12.0
 # 이보다 짧으면 요약을 내지 않는다. 매칭 단계의 순간 스파이크가 '판'으로
 # 잡히는 걸 막는다.
 MATCH_MIN_SECONDS = 30.0
+# 판을 '시작'하려면 수신이 송신의 이 비율 이상이어야 한다. 연결 수립 중에는
+# 송신이 먼저 붙고 수신이 뒤따른다(실측: 96pkt/s ↑66↓30 -> 132pkt/s ↑66↓66).
+# 그 구간은 대전이 아니라 접속 중이고, 갭이 몰려 있어 그냥 두면 멀쩡한 판의
+# 등급을 통째로 끌어내린다. 시작 조건에만 쓴다 - 판 도중의 비대칭은 렉일 수
+# 있고, 그게 종료인지 렉인지 가를 근거가 아직 없다.
+MATCH_START_SYMMETRY = 0.8
 
 # 상대 IP -> 국가/ISP. iptoasn.com의 ip2asn-v4.tsv (탭 구분).
 # 없으면 조용히 비활성화된다 - 부가 기능 때문에 본체가 죽으면 안 된다.
@@ -573,6 +579,13 @@ class Flow:
             # 굶은 게 아니므로 FRAME_MS 미만은 애초에 갭이 아니다.
             threshold = max(self.median_gap * FRAME_GAP_FACTOR, FRAME_MS)
             self.frame_gaps = sum(1 for g in gaps if g > threshold)
+            # 횟수만 세면 30ms 갭과 490ms 갭이 똑같이 1이 된다. 앞은 체감이
+            # 없고 뒤는 눈에 보이는 멈춤이다. 그래서 '몇 프레임을 굶었는가'도
+            # 같이 센다 - 간격이 한 프레임을 넘은 만큼이 게임이 실제로
+            # 기다린 프레임 수다. 판 등급은 횟수가 아니라 이걸로 매긴다.
+            self.starved_frames = sum(
+                g / FRAME_MS - 1.0 for g in gaps if g > threshold
+            )
             self.gap_rate = self.frame_gaps / window if window else 0.0
             self.worst_gap = ordered[-1]
             # 프레임당 1패킷 구조일 때만 '프레임 갭'이 의미를 갖는다.
@@ -583,6 +596,7 @@ class Flow:
             # 표시하는 쪽은 반드시 self.sampled를 먼저 본다.
             self.median_gap = self.p95_gap = self.jitter = 0.0
             self.frame_gaps = 0
+            self.starved_frames = 0.0
             self.gap_rate = 0.0
             self.worst_gap = 0.0
             self.frame_paced = False
@@ -1338,7 +1352,13 @@ def format_log(stamp: str, ip: str, ping: dict, flow: Flow | None) -> str:
 #         중간 지대 데이터가 아예 없다. 판이 쌓이면 반드시 다시 볼 것.
 #
 # 각 표는 (이 값 이하이면, 이 등급). 어디에도 안 걸리면 D.
-GRADE_GAPS_PER_MIN = [(0.0, "A"), (1.0, "B"), (5.0, "C")]
+#
+# 굶은 프레임 비율의 근거 (실측 두 점):
+#   국내 4.4ms 판 (2026-08-24, 3분 18초) ... 약 0.4%  <- 최상급
+#   실측 렉 구간 (6초, 132->16pkt/s)      ... 수십 %  <- 명백한 렉
+# 첫 판을 갭 '횟수'로 재면 7.6회/분이라 D가 나왔다. 30ms와 490ms를 똑같이
+# 1회로 세기 때문이다. 비율로 바꾸니 0.4%로 A가 된다.
+GRADE_STARVE_PCT = [(1.0, "A"), (3.0, "B"), (10.0, "C")]
 GRADE_PING_FRAMES = [(1.0, "A"), (2.0, "B"), (3.0, "C")]  # 편도 프레임
 GRADE_JITTER_MS = [(2.0, "A"), (10.0, "B"), (30.0, "C")]  # 추측값
 
@@ -1388,6 +1408,12 @@ class MatchSummary:
 
         minutes = duration / 60.0
         self.gaps_per_min = self.gaps / minutes if minutes > 0 else 0.0
+        # 등급의 근거는 이쪽이다. 판 전체 프레임 중 몇 %를 굶었는가.
+        self.starved = samples["starved"]
+        self.total_frames = duration * GAME_FPS
+        self.starve_pct = (
+            100.0 * self.starved / self.total_frames if self.total_frames else 0.0
+        )
 
         # 편도가 실제 입력 딜레이다. 왕복의 절반.
         self.frames_rt = ms_to_frames(self.rtt) if self.rtt is not None else None
@@ -1399,7 +1425,7 @@ class MatchSummary:
             else None
         )
         self.g_jitter = grade_of(self.jitter, GRADE_JITTER_MS)
-        self.g_gap = grade_of(self.gaps_per_min, GRADE_GAPS_PER_MIN)
+        self.g_gap = grade_of(self.starve_pct, GRADE_STARVE_PCT)
         self.grade = worst_grade([self.g_ping, self.g_jitter, self.g_gap])
 
 
@@ -1426,8 +1452,8 @@ class MatchTracker:
         self.stamp = ""
         self.last_ok = 0.0
         self._s = {
-            "rtt": [], "interval": [], "jitter": [],
-            "worst": [], "rate": [], "gaps": 0, "hop_windows": 0,
+            "rtt": [], "interval": [], "jitter": [], "worst": [], "rate": [],
+            "gaps": 0, "starved": 0.0, "hop_windows": 0,
         }
 
     @staticmethod
@@ -1440,6 +1466,15 @@ class MatchTracker:
             and flow.rate >= KEEP_RATE
         )
 
+    @staticmethod
+    def can_start(flow) -> bool:
+        """판을 새로 시작해도 되는가 (연결 수립 중이 아닌가).
+
+        수립 중에는 송신이 먼저 붙고 수신이 뒤따른다. 그 구간은 대전이
+        아니라 접속 중이라 갭이 몰려 있다. ↑↓가 대칭이 될 때까지 기다린다.
+        """
+        return flow.up <= 0 or flow.down >= MATCH_START_SYMMETRY * flow.up
+
     def feed(self, now: float, opponent, flow, stats) -> MatchSummary | None:
         """한 창을 반영한다. 판이 방금 끝났으면 그 요약을 돌려준다."""
         ok = self.is_match(flow, opponent)
@@ -1450,7 +1485,9 @@ class MatchTracker:
             done = self._finish()
 
         if self.ip is None:
-            if ok:
+            # 시작에만 대칭을 요구한다. 이미 시작된 판은 ok만 보면 된다 -
+            # 도중의 비대칭은 렉일 수 있다.
+            if ok and self.can_start(flow):
                 self._begin(opponent, now)
         if self.ip is not None:
             if ok:
@@ -1484,6 +1521,7 @@ class MatchTracker:
         s["worst"].append(flow.worst_gap)
         s["rate"].append(flow.rate)
         s["gaps"] += flow.frame_gaps
+        s["starved"] += flow.starved_frames
 
     def _finish(self) -> MatchSummary | None:
         ip, stamp = self.ip, self.stamp
@@ -1530,8 +1568,11 @@ def format_match_summary(m: MatchSummary) -> list[str]:
     lines.append(f"  간격  {m.interval:.1f}ms")
     lines.append(f"  지터  중앙 {m.jitter:.1f}ms   최대 {m.jitter_max:.1f}ms")
     gap_tail = f"   최악 {m.gap_worst:.0f}ms" if m.gaps else ""
+    lines.append(f"  갭    {m.gaps}회{gap_tail}   ({m.gaps_per_min:.1f}회/분)")
+    # 등급은 횟수가 아니라 이 줄로 매긴다.
     lines.append(
-        f"  갭    {m.gaps}회{gap_tail}   ({m.gaps_per_min:.1f}회/분)"
+        f"  굶음  {m.starved:.0f}프레임 / {m.total_frames:,.0f}"
+        f"   ({m.starve_pct:.2f}%)"
     )
     return lines
 
