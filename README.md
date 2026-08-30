@@ -17,10 +17,7 @@ SC6와 스팀이 점유한 User Datagram Protocol(UDP) 포트만 골라 캡처�
 
 # 측정 대상
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/overview-dark.svg">
-  <img alt="수동 측정(도착 간격 → 지터·갭)과 능동 측정(ICMP → 왕복 시간) 두 갈래로 재서 화면·로그·판 요약으로 낸다" src="docs/overview-light.svg" width="900">
-</picture>
+<img alt="수동 측정(도착 간격 → 지터·갭)과 능동 측정(ICMP → 왕복 시간) 두 갈래로 재서 화면·로그·판 요약으로 낸다" src="docs/overview-dark.svg" width="900">
 
 게임 화면은 1초에 60장을 그리므로 1프레임은 약 16.67ms다. 패킷을 보내도 받는 시간이 "49ms 걸렸다"라는 뜻은 게임에서 약 "3프레임 정도 밀렸다"로 해석할 수 있고 이것을 렉이라고 한다.
 
@@ -37,10 +34,7 @@ SC6와 스팀이 점유한 User Datagram Protocol(UDP) 포트만 골라 캡처�
 
 # 관측 화면 — 게임 내 오버레이
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/overlay.png">
-  <img alt="수동 측정(도착 간격 → 지터·갭)과 능동 측정(ICMP → 왕복 시간) 두 갈래로 재서 화면·로그·판 요약으로 낸다" src="docs/overview-light.svg" width="900">
-</picture>
+<img alt="게임 화면 위 RTSS 오버레이 한 줄 — 국가 JP, 왕복 지연 >=55ms, >=3.3프레임, 지터 1.1, 갭 0.0" src="docs/overlay.png" width="900">
 
 # 관측 화면 — 판 종료 결과
 
