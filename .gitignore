@@ -1,6 +1,37 @@
 .venv/
+venv/
 __pycache__/
 *.py[cod]
-run.log
+
+# 개인정보가 들어가는 산출물 — 커밋하지 않는다
+# 실행 로그에는 상대 IP가 평문으로 남는다 (run*.log 외의 이름도 막는다)
+*.log
+# 패킷 캡처 원본은 주소도 내용도 통째로 들어간다
+*.pcap
+*.pcapng
+# 마스킹 전 스크린샷 원본 자리. docs/ 아래 나머지는 공개용이다
+docs/raw/
+
+# 국가/ISP 대역표 (30MB, iptoasn.com에서 각자 받는다)
 ip2asn-v4.tsv
 ip2asn-v4.tsv.gz
+
+# 개인 학습·운영 문서 — 로컬에서만 쓴다
+CONCEPTS.md
+STUDY.md
+study-plan.md
+CHECKLIST.md
+INTERVIEW.md
+TOOLING.md
+CLAUDE.md
+
+# 도구 캐시
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 에디터 · OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

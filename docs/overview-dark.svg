@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 400" width="900" height="400" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif" role="img" aria-label="sc6-ping이 재는 것 — 수동·능동 두 갈래 측정 요약">
+<title>sc6-ping이 재는 것 — 수동·능동 두 갈래 측정 요약</title>
+<defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6e7681"/></marker></defs>
+<rect width="900" height="400" fill="#0d1117"/>
+<text x="450" y="34" font-size="15" fill="#e6edf3" font-weight="600" text-anchor="middle">SC6는 늦게 온 상대 입력을 되감지 못하고, 화면을 멈춘 채 기다린다 = 굶은 프레임</text>
+<rect x="280" y="54" width="340" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="450" y="81" font-size="15" fill="#e6edf3" font-weight="700" text-anchor="middle">상대 패킷이 16.67ms마다 오는가?</text>
+<path d="M450,96 L450,114" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<path d="M215,114 L685,114" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<path d="M215,114 L215,136" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#ar)"/>
+<path d="M685,114 L685,136" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="40" y="142" width="350" height="122" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+<text x="60" y="168" font-size="14" fill="#58a6ff" font-weight="700" text-anchor="start">수동 — 내가 상대의 송신 패킷을 본다</text>
+<path d="M60,178 L370,178" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="60" y="202" font-size="13" fill="#e6edf3" font-weight="normal" text-anchor="start">패킷이 도착한 간격을 잰다</text>
+<text x="60" y="228" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="start">→  지터 — 그 간격이 흔들린 폭</text>
+<text x="60" y="252" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="start">→  갭 — 그 간격이 2프레임을 넘긴 횟수</text>
+<rect x="510" y="142" width="350" height="122" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+<text x="530" y="168" font-size="14" fill="#bc8cff" font-weight="700" text-anchor="start">능동 — 내가 상대에게 핑을 쏜다</text>
+<path d="M530,178 L840,178" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="530" y="202" font-size="13" fill="#e6edf3" font-weight="normal" text-anchor="start">ICMP로 왕복 시간을 잰다</text>
+<text x="530" y="228" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="start">→  왕복 시간 ÷ 16.67ms = 프레임</text>
+<text x="530" y="252" font-size="13" fill="#e6edf3" font-weight="600" text-anchor="start">→  상대가 ICMP를 막으면 폴백으로 하한만 잰다</text>
+<path d="M215,264 L215,288 L450,288" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<path d="M685,264 L685,288 L450,288" fill="none" stroke="#6e7681" stroke-width="1.5"/>
+<path d="M450,288 L450,310" fill="none" stroke="#6e7681" stroke-width="1.5" marker-end="url(#ar)"/>
+<rect x="230" y="316" width="440" height="42" rx="8" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+<text x="450" y="343" font-size="14" fill="#e6edf3" font-weight="700" text-anchor="middle">RTSS 오버레이 · 콘솔 로그 · 판 요약</text>
+<text x="450" y="384" font-size="12.5" fill="#9198a1" font-weight="normal" text-anchor="middle">체감을 정하는 건 평균 핑이 아니라 도착 간격이 튀는 순간이다</text>
+</svg>

@@ -35,6 +35,7 @@ import re
 import sys
 import time
 import array
+import atexit
 import bisect
 import ctypes
 import shutil
@@ -65,6 +66,11 @@ DISPLAY_INTERVAL = 0.25  # OSD 갱신 (4Hz). 이보다 빠르면 사람이 못 �
 LOG_INTERVAL = 2.0  # 콘솔 로그 한 줄
 RESELECT_SECONDS = 5.0  # 상대 재선정 / 포트 재열거 주기
 POLL_INTERVAL = 0.2  # 블로킹을 쪼개는 단위 = Ctrl+C 응답 시간
+
+# 화면과 로그에 나가는 IP를 14.XXX.XXX.XXX로 가린다. 스크린샷을 찍을 때만
+# 켜면 된다 - False로 되돌리면 원본 IP가 그대로 나온다. 조회와 측정은
+# 이 값과 무관하게 항상 원본 IP로 한다.
+MASK_IP = True
 
 # 상대 후보로 새로 인정할 최소 패킷 속도 (pkt/s).
 # 실측: 실제 대전은 132pkt/s(프레임당 1패킷, ↑↓ 1:1), 매칭 단계의 잡담은
@@ -275,6 +281,20 @@ def get_local_ip() -> str:
         s.close()
 
 
+def mask_ip(ip: str) -> str:
+    """표시용으로 IP의 앞 한 자리만 남기고 가린다 — 14.XXX.XXX.XXX.
+
+    스크린샷용이다. MASK_IP로 켜고 끈다. 국가·ISP 조회와
+    핑·추적은 전부 원본 IP로 하고, 화면과 로그에 나가는 순간에만 가린다.
+    """
+    if not MASK_IP:
+        return ip
+    parts = ip.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return f"{parts[0]}.XXX.XXX.XXX"
+    return ip
+
+
 def is_valve_relay(ip: str) -> bool:
     """스팀 릴레이 IP인지 (상대가 아니라 중계 서버)."""
     try:
@@ -383,6 +403,95 @@ def match_console_encoding() -> None:
             )
         except Exception:
             pass  # 못 바꿔도 측정은 돌아간다
+
+
+
+# ---------------------- 실행 로그 파일 ----------------------
+# 파일명은 프로세스를 켠 순간의 월일-시분으로 굳힌다. 실행 중에 날짜가
+# 바뀌어도 파일이 갈리지 않는다 ― 한 판이 두 파일에 나뉘면 판 요약과
+# 그 판의 원본 줄이 서로 다른 곳에 남는다.
+LOG_NAME_FORMAT = "run-%m%d-%H%M.log"
+LOG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class Tee:
+    """화면과 로그 파일에 같은 줄을 동시에 쓴다.
+
+    Tee-Object를 파이프로 물리는 대신 프로세스 안에서 갈래를 튼다.
+    파이프가 없으니 sys.stdout이 콘솔(tty)로 남고, 그래서
+    match_console_encoding()이 건드릴 게 없어진다 ― 화면은 WriteConsoleW로
+    그대로 나가고 파일만 UTF-8로 받는다. cp949에 없는 글자(em dash 등)
+    때문에 로그가 깨지던 문제가 애초에 생기지 않는다.
+
+    파일 쓰기 실패는 삼킨다. 로그 한 줄 때문에 측정이 죽으면 안 된다.
+    """
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+
+    def write(self, text):
+        written = self._stream.write(text)
+        try:
+            self._handle.write(text)
+        except Exception:
+            pass
+        return written
+
+    def write_wide(self, text):
+        """화면에는 창 폭에 맞춰 자른 줄을, 파일에는 원문을 쓴다.
+
+        emit()이 쓰는 갈래다. 화면용 절단을 write() 앞에서 하면 파일에도
+        잘린 채 들어가서, 좁은 창으로 켠 세션의 로그는 사후 분석이 안 된다
+        (실측: 70칸 창에서 창별 `갭` 값이 통째로 밀려 나갔다).
+        """
+        self._stream.write(fit_width(text) + "\n")
+        try:
+            self._handle.write(text + "\n")
+        except Exception:
+            pass
+
+    def flush(self):
+        self._stream.flush()
+        try:
+            self._handle.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        # isatty/fileno/encoding/reconfigure 등 나머지는 원래 스트림 것을 쓴다.
+        return getattr(self._stream, name)
+
+
+def start_logging():
+    """stdout/stderr를 로그 파일로도 흘려보낸다. 실패해도 측정은 계속한다.
+
+    돌려주는 값은 로그 파일 경로, 못 열었으면 None.
+    """
+    path = os.path.join(LOG_DIR, time.strftime(LOG_NAME_FORMAT))
+    try:
+        # buffering=1 = 줄 단위. Ctrl+C로 끊어도 마지막 줄까지 남는다.
+        # "a"는 같은 분 안에 두 번 켰을 때 앞 실행을 지우지 않으려고.
+        handle = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as e:
+        print(f"[*] 로그 파일을 열지 못했습니다 ({e}). 화면에만 출력합니다.")
+        return None
+    sys.stdout = Tee(sys.stdout, handle)
+    sys.stderr = Tee(sys.stderr, handle)
+    atexit.register(handle.close)
+    return path
+
+
+def emit(line: str) -> None:
+    """관측 한 줄을 낸다 — 화면은 폭에 맞춰 자르고, 로그 파일에는 원문 그대로.
+
+    로그 파일을 못 열었으면 Tee가 없으므로 예전처럼 잘라서 화면에만 낸다.
+    """
+    out = sys.stdout
+    if isinstance(out, Tee):
+        out.write_wide(line)
+    else:
+        print(fit_width(line))
 
 
 
@@ -992,12 +1101,12 @@ class Pinger(threading.Thread):
         found = self._trace_result
         self._trace_done = False  # 안내는 대상당 한 번만
         if found is None:
-            self.trace_note = f"{target}: ICMP 차단 ― 경로상 응답하는 홉도 없음"
+            self.trace_note = f"{mask_ip(target)}: ICMP 차단 ― 경로상 응답하는 홉도 없음"
         elif found.weak:
             # 경로가 일찍 끊긴 추정치는 실제와 무관할 수 있다.
             # 숫자를 만들어 보여주느니 안 쓰는 편이 낫다.
             self.trace_note = (
-                f"{target}: ICMP 차단 ― 경로가 {found.hop}홉에서 끊겨"
+                f"{mask_ip(target)}: ICMP 차단 ― 경로가 {found.hop}홉에서 끊겨"
                 f"(이후 {found.dark_after}홉 무응답) 추정 불가"
             )
         else:
@@ -1008,7 +1117,7 @@ class Pinger(threading.Thread):
             # 값은 여전히 하한이지만 그 사실을 숨기지 않는다.
             limit = f", {TRACE_MAX_HOPS}홉까지만 추적" if found.truncated else ""
             self.trace_note = (
-                f"{target}: ICMP 차단 ― {found.ip}({found.hop}홉)까지"
+                f"{mask_ip(target)}: ICMP 차단 ― {mask_ip(found.ip)}({found.hop}홉)까지"
                 f" 재서 하한으로 표시합니다{limit}"
             )
 
@@ -1371,7 +1480,7 @@ def format_log(stamp: str, ip: str, ping: dict, flow: Flow | None) -> str:
         if ping["avg"] is not None and ping["loss"] and not ping["hop"]
         else ""
     )
-    return f"{stamp}  {ip:<15s}  {head}{loss}{tail}"
+    return f"{stamp}  {mask_ip(ip):<15s}  {head}{loss}{tail}"
 
 
 # ---------------------- 판 단위 요약과 평가 ----------------------
@@ -1570,11 +1679,11 @@ class MatchTracker:
 
 def format_match_summary(m: MatchSummary) -> list[str]:
     """판 요약 블록. 호출부가 각 줄을 fit_width()로 자른다."""
-    who = m.ip
+    who = mask_ip(m.ip)
     if m.geo:
         label = m.geo.label()
         if label:
-            who = f"{m.ip}  {label}"
+            who = f"{mask_ip(m.ip)}  {label}"
     lines = [
         "",
         f"[판 종료] {who}   {duration_text(m.duration)}",
@@ -1634,7 +1743,7 @@ class SessionTally:
             where = m.geo.country if m.geo and m.geo.cc else ""
             where = f" {where}" if where else ""
             out.append(
-                f"      {m.stamp}  {m.ip}{where}"
+                f"      {m.stamp}  {mask_ip(m.ip)}{where}"
                 f"  {duration_text(m.duration)}  {m.grade}"
             )
         return out
@@ -1682,7 +1791,10 @@ def monitor_session(
             return
         tally.add(summary)
         for line in format_match_summary(summary):
-            print(fit_width(line) if line else "")
+            if line:
+                emit(line)
+            else:
+                print()
 
     def on_packet(pkt):
         if IP not in pkt or UDP not in pkt:
@@ -1748,7 +1860,7 @@ def monitor_session(
                     if opponent:
                         label = opp_geo.label() if opp_geo else ""
                         tail = f"  {label}" if label else ""
-                        print(fit_width(f"[*] 상대: {opponent}{tail}"))
+                        emit(f"[*] 상대: {mask_ip(opponent)}{tail}")
                 traffic.forget({opponent} if opponent else set())
 
             # --- 표시 ---
@@ -1769,11 +1881,9 @@ def monitor_session(
                 idle_state = None
                 if now - last_log >= LOG_INTERVAL:
                     last_log = now
-                    print(
-                        fit_width(
-                            format_log(
-                                time.strftime("%H:%M:%S"), opponent, stats, flow
-                            )
+                    emit(
+                        format_log(
+                            time.strftime("%H:%M:%S"), opponent, stats, flow
                         )
                     )
                     # 표본은 여기서만 모은다. 표시 틱(250ms)에서 모으면
@@ -1799,11 +1909,9 @@ def monitor_session(
                     idle_state = state
                     stamp = time.strftime("%H:%M:%S")
                     if state == "relay":
-                        print(
-                            fit_width(
-                                f"{stamp}  릴레이 경유 매치 ― 상대 IP 노출 안 됨,"
-                                f" 측정 불가 ({relay_rate:.0f}pkt/s)"
-                            )
+                        emit(
+                            f"{stamp}  릴레이 경유 매치 ― 상대 IP 노출 안 됨,"
+                            f" 측정 불가 ({relay_rate:.0f}pkt/s)"
                         )
                     else:
                         print(f"{stamp}  대전 트래픽 없음")
@@ -1821,12 +1929,12 @@ def monitor_session(
         if rollup:
             print()
             for line in rollup:
-                print(fit_width(line))
+                emit(line)
 
 
 def run():
     local_ip = get_local_ip()
-    print(f"[*] 로컬 IP: {local_ip}")
+    print(f"[*] 로컬 IP: {mask_ip(local_ip)}")
     print(
         f"[*] 화면 {1 / DISPLAY_INTERVAL:.0f}Hz / 로그 {LOG_INTERVAL:.0f}초"
         "  (Ctrl+C 로 종료)"
@@ -1853,6 +1961,11 @@ def run():
 if __name__ == "__main__":
     # run()보다 먼저. 기동 실패 메시지도 안 깨져야 원인을 읽을 수 있다.
     match_console_encoding()
+    # 로그도 run()보다 먼저 연다. 캡처 기동 실패 메시지가 파일에 남아야
+    # "왜 안 됐는지"를 나중에 다시 읽을 수 있다.
+    log_path = start_logging()
+    if log_path:
+        print(f"[*] 로그: {os.path.basename(log_path)}")
     try:
         run()
     except KeyboardInterrupt:
